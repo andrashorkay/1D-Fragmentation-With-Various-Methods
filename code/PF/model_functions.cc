@@ -1,4 +1,5 @@
 #include <aka_common.hh>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -87,7 +88,13 @@ void writeSimulationDump(CouplerSolidPhaseField& model,
   PhaseFieldFragmentManager fragment_data(
       phase, params.damage_limit, "fragments");
 
-  const Int n_fragments = fragment_data.countFragments("fragment");
+  const Int n_fragments = fragment_data.countFragments1D();
+  const auto fragment_sizes = fragment_data.computeFragmentSizes1D();
+
+  if (static_cast<Int>(fragment_sizes.size()) != n_fragments) {
+    throw std::runtime_error(
+        "1D fragment count and fragment-size vector are inconsistent.");
+  }
 
   const auto& coordinates = mesh.getNodes();
   const auto& mass = solid.getMass();
@@ -101,35 +108,49 @@ void writeSimulationDump(CouplerSolidPhaseField& model,
   Real max_fragment_size = 0.0;
 
   if (n_fragments > 0) {
-    min_fragment_size = params.bar_length;
+    min_fragment_size = fragment_sizes[0];
+    max_fragment_size = fragment_sizes[0];
   }
 
-  for (Int i = 0; i < n_fragments; ++i) {
-    auto& fragment_group = fragment_data.getFragment(i);
-    const auto& nodes = fragment_group.getNodeGroup().getNodes();
+  Real bar_left = std::numeric_limits<Real>::max();
 
-    Real x_min = std::numeric_limits<Real>::max();
-    Real x_max = std::numeric_limits<Real>::lowest();
+  for (Int node = 0; node < mesh.getNbNodes(); ++node) {
+    bar_left = std::min(bar_left, coordinates(node, 0));
+  }
+
+  Real fragment_left = bar_left;
+
+  for (Int i = 0; i < n_fragments; ++i) {
+    const Real fragment_size = fragment_sizes[i];
+    const Real fragment_right = fragment_left + fragment_size;
 
     Real fragment_mass = 0.0;
     Real weighted_centre = 0.0;
     Real weighted_velocity = 0.0;
 
-    for (auto node : nodes) {
+    for (Int node = 0; node < mesh.getNbNodes(); ++node) {
       const Real x = coordinates(node, 0);
-      const Real node_mass = mass(node, 0);
 
-      x_min = std::min(x_min, x);
-      x_max = std::max(x_max, x);
+      bool belongs_to_fragment = false;
+
+      if (i == n_fragments - 1) {
+        belongs_to_fragment = x >= fragment_left && x <= fragment_right;
+      } else {
+        belongs_to_fragment = x >= fragment_left && x < fragment_right;
+      }
+
+      if (!belongs_to_fragment) {
+        continue;
+      }
+
+      const Real node_mass = mass(node, 0);
 
       fragment_mass += node_mass;
       weighted_centre += node_mass * x;
       weighted_velocity += node_mass * velocity(node, 0);
     }
 
-    const Real fragment_size = x_max - x_min;
-
-    Real fragment_centre = 0.0;
+    Real fragment_centre = 0.5 * (fragment_left + fragment_right);
     Real fragment_velocity = 0.0;
 
     if (fragment_mass > 0.0) {
@@ -148,14 +169,10 @@ void writeSimulationDump(CouplerSolidPhaseField& model,
     fragments.push_back(fragment);
 
     mean_fragment_size += fragment_size;
+    min_fragment_size = std::min(min_fragment_size, fragment_size);
+    max_fragment_size = std::max(max_fragment_size, fragment_size);
 
-    if (fragment_size < min_fragment_size) {
-      min_fragment_size = fragment_size;
-    }
-
-    if (fragment_size > max_fragment_size) {
-      max_fragment_size = fragment_size;
-    }
+    fragment_left = fragment_right;
   }
 
   if (n_fragments > 0) {
@@ -387,7 +404,7 @@ void runSimulation(CouplerSolidPhaseField& model,
   Int previous_nb_fragments = -1;
   UInt stable_fragment_checks = 0;
 
-  const UInt check_frequency = params.number_elements;
+  const UInt check_frequency = 1000;
   const UInt required_stable_checks = params.stable_steps;
 
   // Simulation variables
@@ -395,6 +412,8 @@ void runSimulation(CouplerSolidPhaseField& model,
   Int step = 0;
 
   double simulation_wall_time = 0.0;
+
+  auto& dof_damage = DOFManager.getDOFs("damage");
 
   // Time integration
   std::string stopping_reason;
@@ -413,21 +432,24 @@ void runSimulation(CouplerSolidPhaseField& model,
     }
 
     model.solve("explicit_lumped", "static");
+    // Update phase-field bounds:
+    // 0 <= delta_d <= 1 - d
+    lower_bound.set(0.);
+    upper_bound.set(1.);
+
+    DOFManager.assembleToGlobalArray("damage", dof_damage, upper_bound, -1.);
+
+    tao_solver.setBounds(lower_bound, upper_bound);
 
     time += dt;
     ++step;
-
-    // Update phase-field bounds
-    lower_bound.set(0.);
-    upper_bound.set(PETSC_INFINITY);
-    tao_solver.setBounds(lower_bound, upper_bound);
 
     // Check whether the fragment count has stabilised
     if (step % check_frequency == 0) {
       PhaseFieldFragmentManager fragment_count(
           phase, params.damage_limit, "check");
 
-      const Int nb_fragments = fragment_count.countFragments("check");
+      const Int nb_fragments = fragment_count.countFragments1D();
 
       if (nb_fragments == previous_nb_fragments && nb_fragments > 1) {
         ++stable_fragment_checks;
@@ -482,7 +504,7 @@ void runSimulation(CouplerSolidPhaseField& model,
   PhaseFieldFragmentManager final_fragments(
       phase, params.damage_limit, "final_fragments");
 
-  const Int n_fragments = final_fragments.countFragments("final_fragment");
+  const Int n_fragments = final_fragments.countFragments1D();
 
   // Final energy balance
   const Real E_pot_final = solid.getEnergy("potential");

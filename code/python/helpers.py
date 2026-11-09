@@ -743,3 +743,44 @@ def pf_stress_evolution(run_path):
     max_stress = data["max_stress"].to_numpy()
 
     return time, average_stress, max_stress
+
+# =============================================================================
+# Read final individual fragment sizes
+# =============================================================================
+
+def final_fragment_sizes(run_path):
+
+    run_path = Path(run_path)
+
+    params = read_parameters_file(run_path / "parameters_used.dat")
+
+    fragment_file = params["user"].get("fragment_file", "fragments.out")
+    fragment_path = run_path / fragment_file
+
+    if not fragment_path.exists():
+        raise FileNotFoundError(
+            f"Fragment file not found: {fragment_path}"
+        )
+
+    data = read_output_file(fragment_path)
+
+    if "time" in data.columns:
+
+        final_time = data["time"].max()
+
+        data = data[
+            np.isclose(data["time"], final_time)
+        ]
+
+    if "size" not in data.columns:
+        raise ValueError(
+            f"No 'size' column found in {fragment_path}. "
+            f"Columns are: {list(data.columns)}"
+        )
+
+    sizes = data["size"].to_numpy(dtype=float)
+
+    sizes = sizes[np.isfinite(sizes)]
+    sizes = sizes[sizes > 0]
+
+    return sizes
