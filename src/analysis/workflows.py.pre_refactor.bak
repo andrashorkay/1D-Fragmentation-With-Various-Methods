@@ -1,0 +1,1396 @@
+# SPDX-License-Identifier: GPL-2.0-only
+"""Coordinate fragmentation analyses from the command-line interface.
+
+This module glues
+file readers, numerical calculations, and plotting together; reusable
+mathematical formulae and figure creation live in their own modules.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+import json
+from pathlib import Path
+import re
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from .calculations.fragmentation import (
+    final_fragment_statistics,
+    fit_strain_rate_scaling,
+)
+from .config import DATA_DIR, DEFAULT_FIGURE_DPI, FIGURES_DIR
+from .io import load_case
+from .io.readers import find_case_directories
+from .plots.strain_rate import plot_strain_rate
+
+
+def _output_path(method: str, sweep_dir: Path, explicit: Path | None) -> Path:
+    """Choose a figure path without hard-coding an experiment directory."""
+    if explicit is not None:
+        result = explicit.expanduser()
+    else:
+        method_root = DATA_DIR / method
+        try:
+            relative = sweep_dir.resolve().relative_to(method_root.resolve())
+        except ValueError:
+            relative = Path(sweep_dir.name)
+        result = FIGURES_DIR / method / relative / "mean_fragment_size.png"
+
+    if result.suffix.lower() not in {".png", ".pdf", ".svg"}:
+        raise ValueError("--output must end in .png, .pdf or .svg")
+    return result
+
+
+def _strain_rate(case, folder: Path) -> float:
+    """Read strain rate from the case parameters, checking the folder name."""
+    configured = case.parameters.get("strain_rate")
+    folder_rate = None
+    try:
+        folder_rate = float(folder.name.removeprefix("rate_"))
+    except ValueError:
+        pass
+
+    if configured is None:
+        if folder_rate is None:
+            raise ValueError(
+                "Strain rate missing in parameters and directory name"
+            )
+        warnings.warn(
+            f"{folder.name}: no recorded strain_rate; using directory name",
+            stacklevel=2,
+        )
+        rate = folder_rate
+    else:
+        rate = float(configured)
+        if folder_rate is not None and not np.isclose(
+            rate, folder_rate, rtol=1e-6
+        ):
+            raise ValueError(
+                f"Strain rate mismatch: parameters={rate}, folder={folder_rate}"
+            )
+
+    if not np.isfinite(rate) or rate <= 0:
+        raise ValueError(f"Invalid strain rate: {rate}")
+    return rate
+
+
+def _fragment_length(case) -> tuple[float, int, str, float]:
+    """Mean fragment length in metres, preferring measured fragments.
+
+    If no individual fragment records exist, use the last recorded mean in
+    the global diagnostic history.  The fallback is labelled in the output.
+    """
+    if case.fragments is not None and not case.fragments.empty:
+        stats = final_fragment_statistics(case)
+        snapshot_time = float(case.fragments["time"].max())
+        return stats.mean_size, stats.count, "fragments", snapshot_time
+
+    last = case.history.iloc[-1]
+    size = float(last["mean_fragment_size"])
+    if not np.isfinite(size) or size <= 0:
+        raise ValueError(
+            "No positive mean fragment size in fragments or history"
+        )
+
+    count = int(last["num_fragments"])
+    if count < 1:
+        raise ValueError("Invalid fragment count in history")
+    snapshot_time = float(case.history["time"].iloc[-1])
+    return size, count, "history", snapshot_time
+
+
+def _warn_mixed_setups(cases: list) -> None:
+    """Flag numerical changes that could confound a strain-rate comparison."""
+    fixed_keys = (
+        "dx",
+        "horizon",
+        "number_elements",
+        "time_step_factor",
+        "l0",
+        "l0_scale",
+        "bar_length",
+        "length",
+    )
+    for key in fixed_keys:
+        values = [
+            case.parameters[key] for case in cases if key in case.parameters
+        ]
+        if len(values) < 2:
+            continue
+        try:
+            numeric = np.asarray(values, dtype=float)
+        except (TypeError, ValueError):
+            different = len({str(value) for value in values}) > 1
+        else:
+            different = not np.allclose(numeric, numeric[0], rtol=1e-9, atol=0)
+        if different:
+            warnings.warn(
+                f"Parameter {key!r} changes between cases; "
+                "the scaling may include numerical effects",
+                stacklevel=2,
+            )
+
+
+def _material_properties(case) -> tuple[float, float]:
+    """Return density (kg/m^3) and toughness (J/m^2) for Grady's formula."""
+    parameters = case.parameters
+
+    rho = next(
+        (parameters[key] for key in ("rho", "density") if key in parameters),
+        None,
+    )
+    gc = next(
+        (
+            parameters[key]
+            for key in ("G_c", "gc", "toughness")
+            if key in parameters
+        ),
+        None,
+    )
+
+    # Heterogeneous PF may contain many damage material zones with a common gc.
+    if gc is None and case.method == "PF":
+        zones = case.materials.get("phase_field", {}).values()
+        values = [float(zone["gc"]) for zone in zones if "gc" in zone]
+        if values and np.allclose(values, values[0], rtol=1e-10, atol=0):
+            gc = values[0]
+
+    if rho is None or gc is None:
+        raise ValueError(
+            f"Cannot compute Grady curve for {case.path}: missing density or G_c"
+        )
+
+    rho, gc = float(rho), float(gc)
+    if not (np.isfinite(rho) and np.isfinite(gc) and rho > 0 and gc > 0):
+        raise ValueError(f"Invalid density or G_c in {case.path}")
+    return rho, gc
+
+
+def _nominal_strength(value: float | int | str) -> float:
+    """Read nominal strength in Pa from a scalar or an Akantu distribution.
+
+    For example, Akantu may record ``262000000 uniform [0, 1000000]``.
+    The leading scalar is the nominal reference strength; the distribution
+    expression is retained in the case's original material parameters.
+    """
+    if isinstance(value, str):
+        # Accept a plain scalar or the project's Akantu uniform specification.
+        match = re.fullmatch(
+            r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+            r"(?:\s+uniform\s*\[[^\]]+\])?\s*",
+            value,
+        )
+        if match is None:
+            raise ValueError(
+                f"Cannot extract nominal sigma_c from {value!r}. "
+                "Provide --reference-strength in Pa."
+            )
+        value = match.group(1)
+
+    strength = float(value)
+    if not np.isfinite(strength) or strength <= 0:
+        raise ValueError(
+            f"Nominal sigma_c must be positive and finite: {value!r}"
+        )
+    return strength
+
+
+def _normalisation_scales(
+    cases: list, reference_strength: float | None = None
+) -> tuple[float, float]:
+    """Compute reference scales from material parameters, checking consistency.
+
+    For a heterogeneous material, ``sigma_c`` is the nominal reference
+    strength (not the spatially varying individual strengths). If it is not
+    recorded in the simulation input, it must be supplied explicitly.
+    """
+    from .calculations.theory import (
+        characteristic_fragment_size,
+        characteristic_strain_rate,
+    )
+
+    def get_reference(case) -> tuple[float, float, float, float]:
+        params = case.parameters
+        E = params.get("E")
+        rho, gc = _material_properties(case)
+        sigma_c = (
+            reference_strength
+            if reference_strength is not None
+            else next(
+                (params[k] for k in ("sigma_c", "strength") if k in params),
+                None,
+            )
+        )
+        if E is None or sigma_c is None:
+            missing = "E" if E is None else "sigma_c"
+            raise ValueError(
+                f"Missing {missing} in {case.path}. "
+                "For missing nominal strength use --reference-strength 262e6."
+            )
+        return (float(E), rho, _nominal_strength(sigma_c), gc)
+
+    if not cases:
+        raise ValueError("No cases available for normalisation")
+    reference = get_reference(cases[0])
+    for case in cases[1:]:
+        actual = get_reference(case)
+        if not np.allclose(reference, actual, rtol=1e-8, atol=0):
+            raise ValueError(
+                "Material reference parameters differ between simulations: "
+                f"{cases[0].path} has {reference}, but {case.path} has {actual}. "
+                "Use a consistent reference across the sweep."
+            )
+
+    E, rho, sigma_c, gc = reference
+    return (
+        characteristic_strain_rate(E, rho, sigma_c, gc),
+        characteristic_fragment_size(E, sigma_c, gc),
+    )
+
+
+def _rate_directories(
+    low_directory: Path,
+    high_directory: Path | None,
+    high_from: float | None,
+) -> list[Path]:
+    """Select rate cases from one sweep or two resolution-specific sweeps.
+
+    In mixed-resolution mode, the low-resolution directory supplies rates
+    below ``high_from`` and the high-resolution directory supplies rates
+    at or above ``high_from``. Never substitute a low-resolution result when
+    its required high-resolution counterpart is missing.
+    """
+
+    def index_cases(directory: Path) -> dict[float, Path]:
+        indexed: dict[float, Path] = {}
+        for case_dir in find_case_directories(directory, "rate_*"):
+            try:
+                rate = float(case_dir.name.removeprefix("rate_"))
+            except ValueError:
+                warnings.warn(
+                    f"Skipping case with invalid rate directory: {case_dir}",
+                    stacklevel=2,
+                )
+                continue
+            if not np.isfinite(rate) or rate <= 0:
+                raise ValueError(f"Invalid strain rate in directory {case_dir}")
+            if rate in indexed:
+                raise ValueError(
+                    f"Duplicate strain rate {rate:g} in {directory}: "
+                    f"{indexed[rate].name} and {case_dir.name}"
+                )
+            indexed[rate] = case_dir
+        return indexed
+
+    low_cases = index_cases(low_directory)
+    if high_directory is None:
+        return [low_cases[rate] for rate in sorted(low_cases)]
+
+    if high_from is None or not np.isfinite(high_from) or high_from <= 0:
+        raise ValueError(
+            "A positive --high-from value is required with --high-rate-input"
+        )
+
+    high_cases = index_cases(high_directory)
+    selected = {
+        rate: path for rate, path in low_cases.items() if rate < high_from
+    }
+    selected.update(
+        (rate, path) for rate, path in high_cases.items() if rate >= high_from
+    )
+
+    missing_high = sorted(
+        rate
+        for rate in low_cases
+        if rate >= high_from and rate not in high_cases
+    )
+    if missing_high:
+        warnings.warn(
+            "Omitting rates without a high-resolution case in "
+            f"{high_directory}: {missing_high}. "
+            "They will not be taken from the lower-resolution sweep.",
+            stacklevel=2,
+        )
+
+    return [selected[rate] for rate in sorted(selected)]
+
+
+def run_strain_rate(args) -> pd.DataFrame:
+    """Load a rate_* sweep, fit scaling, and plot mean fragment length.
+
+    Every run must contain a final summary.out so that interrupted simulations
+    cannot silently enter a published fit.  Each row documents the origin of
+    its fragment-size measurement.
+    """
+    from .calculations.theory import grady_fragment_size
+
+    method = args.method.upper()
+    sweep_dir = Path(args.input).expanduser().resolve()
+    high_input = getattr(args, "high_rate_input", None)
+    high_from = getattr(args, "high_from", None)
+    high_directory = (
+        Path(high_input).expanduser().resolve()
+        if high_input is not None
+        else None
+    )
+    if high_directory is None and high_from is not None:
+        raise ValueError("--high-from requires --high-rate-input")
+
+    directories = _rate_directories(sweep_dir, high_directory, high_from)
+
+    records = []
+    loaded_cases = []
+    grady_sizes = {}
+    for directory in directories:
+        if not (directory / "summary.out").is_file():
+            warnings.warn(
+                f"Skipping unfinished run {directory.name}: no summary.out",
+                stacklevel=2,
+            )
+            continue
+
+        try:
+            case = load_case(method, directory)
+            rate = _strain_rate(case, directory)
+            size, count, source, snapshot_time = _fragment_length(case)
+        except (FileNotFoundError, ValueError, KeyError) as exc:
+            warnings.warn(f"Skipping {directory.name}: {exc}", stacklevel=2)
+            continue
+
+        if getattr(args, "theory", "none") == "grady":
+            rho, gc = _material_properties(case)
+            grady_sizes[rate] = float(grady_fragment_size(rate, rho=rho, gc=gc))
+
+        loaded_cases.append(case)
+        records.append(
+            {
+                "case": directory.name,
+                "source_directory": str(directory.parent),
+                "number_elements": case.parameters.get("number_elements"),
+                "strain_rate": rate,
+                "mean_fragment_size": size,  # metres
+                "num_fragments": count,
+                "size_source": source,
+                "fragment_snapshot_time": snapshot_time,  # seconds
+                "final_simulation_time": case.summary.get("physical_time"),
+                "stopping_reason": case.summary.get("stopping_reason", ""),
+            }
+        )
+
+    if not records:
+        raise ValueError(
+            f"No completed, readable strain-rate cases in {sweep_dir}"
+        )
+
+    _warn_mixed_setups(loaded_cases)
+
+    result = pd.DataFrame.from_records(records).sort_values("strain_rate")
+    result = result.reset_index(drop=True)
+
+    if result["strain_rate"].duplicated().any():
+        duplicates = result.loc[
+            result["strain_rate"].duplicated(), "strain_rate"
+        ]
+        raise ValueError(
+            "Multiple cases at the same strain rate: "
+            f"{duplicates.tolist()}. Select one consistent sweep."
+        )
+
+    rates = result["strain_rate"].to_numpy(dtype=float)
+    sizes = result["mean_fragment_size"].to_numpy(dtype=float)
+    fit = None
+
+    # Restrict the power-law fit, without removing any points from the plot.
+    # Indexing applies to completed cases after mixed-mesh selection and
+    # sorting by physical strain rate (not to integration time steps).
+    fit_skip_first = getattr(args, "fit_skip_first", 0)
+    if fit_skip_first < 0:
+        raise ValueError("--fit-skip-first must be non-negative")
+    if fit_skip_first and fit_skip_first > len(rates) - 2:
+        raise ValueError(
+            f"Cannot skip {fit_skip_first} points: only {len(rates)} "
+            "completed rates are available, and the fit needs at least two"
+        )
+
+    fit_min = args.fit_min
+    if fit_skip_first:
+        cutoff = float(rates[fit_skip_first])
+        fit_min = max(fit_min, cutoff) if fit_min is not None else cutoff
+
+    if len(result) >= 2:
+        fit = fit_strain_rate_scaling(
+            rates,
+            sizes,
+            fit_min=fit_min,
+            fit_max=args.fit_max,
+        )
+    elif fit_skip_first or args.fit_min is not None or args.fit_max is not None:
+        raise ValueError("At least two rates are needed for the requested fit")
+
+    # Make the selection explicit in the exported CSV.
+    result["used_in_fit"] = (
+        (result["strain_rate"] >= fit.min_rate)
+        & (result["strain_rate"] <= fit.max_rate)
+        if fit is not None
+        else False
+    )
+
+    theory_sizes = None
+    if getattr(args, "theory", "none") == "grady":
+        theory_sizes = np.asarray([grady_sizes[rate] for rate in rates])
+
+    characteristic_rate = None
+    characteristic_size = None
+    if getattr(args, "normalised", False):
+        characteristic_rate, characteristic_size = _normalisation_scales(
+            loaded_cases, getattr(args, "reference_strength", None)
+        )
+        result["rate_hat"] = result["strain_rate"] / characteristic_rate
+        result["size_hat"] = result["mean_fragment_size"] / characteristic_size
+        if theory_sizes is not None:
+            result["grady_hat"] = theory_sizes / characteristic_size
+
+    fig, _ = plot_strain_rate(
+        rates,
+        sizes,
+        method=method,
+        fit=fit,
+        theory_sizes=theory_sizes,
+        size_unit="mm",
+        characteristic_rate=characteristic_rate,
+        characteristic_size=characteristic_size,
+    )
+    fig.tight_layout()
+
+    print(f"\n{method} strain-rate sweep: {sweep_dir}")
+    if characteristic_rate is not None:
+        print(
+            f"Reference: eps_dot_0 = {characteristic_rate:.6g} s^-1, "
+            f"s_0 = {characteristic_size * 1e3:.6g} mm"
+        )
+    if high_directory is not None:
+        print(
+            f"High-resolution cases: {high_directory} "
+            f"for strain rates >= {high_from:g} s^-1"
+        )
+    print()
+    print(result.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    if fit is None:
+        print("\nNo power-law fit: fewer than two completed cases.")
+    else:
+        print(
+            f"\nScaling exponent m = {fit.exponent:.6g}, "
+            f"R² = {fit.r_squared:.6g} "
+            f"({fit.n_points} rates: {fit.min_rate:g}–{fit.max_rate:g} s^-1)"
+        )
+
+    save = args.save or args.output is not None
+    if save:
+        figure_path = _output_path(method, sweep_dir, args.output)
+        if high_directory is not None and args.output is None:
+            figure_path = figure_path.with_name(
+                figure_path.stem + "_mixed_mesh" + figure_path.suffix
+            )
+        if characteristic_rate is not None and args.output is None:
+            figure_path = figure_path.with_name(
+                figure_path.stem + "_normalised" + figure_path.suffix
+            )
+        figure_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(figure_path, dpi=DEFAULT_FIGURE_DPI, bbox_inches="tight")
+
+        csv_path = figure_path.with_name(figure_path.stem + "_summary.csv")
+        result.to_csv(csv_path, index=False)
+        print(f"\nFigure: {figure_path}\nSummary: {csv_path}")
+
+        if fit is not None:
+            fit_path = figure_path.with_name(figure_path.stem + "_fit.json")
+            fit_path.write_text(
+                json.dumps(asdict(fit), indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"Fit: {fit_path}")
+
+    if args.no_show:
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return result
+
+
+# ============================================================================
+# Convergence analysis
+# ============================================================================
+
+_CONVERGENCE_QUANTITIES = {
+    "peak_stress": "peak_average_stress_Pa",
+    "fracture_energy": "final_fracture_energy_J",
+    "recoverable_energy": "final_recoverable_energy_J",
+    "kinetic_energy": "final_kinetic_energy_J",
+    "fragments": "raw_num_fragments",
+    "mean_fragment_size": "mean_fragment_size_m",
+    "energy_error": "max_relative_energy_error",
+    "wall_time": "simulation_wall_time_s",
+}
+
+
+def _number_or_nan(value) -> float:
+    """Return a finite numerical value or NaN for unavailable diagnostics."""
+    try:
+        result = float(value)
+    except (ValueError, TypeError):
+        return float("nan")
+    return result if np.isfinite(result) else float("nan")
+
+
+def _convergence_parameter(cases: list, parameter: str) -> str:
+    """Select the recorded parameter shared by all cases."""
+    candidates = {
+        "dt": ("time_step_factor", "dt"),
+        "dx": ("dx", "number_elements"),
+        "horizon": ("horizon",),
+        "l0": ("l0_scale", "l0"),
+    }[parameter]
+    for name in candidates:
+        if all(
+            np.isfinite(_number_or_nan(case.parameters.get(name)))
+            for case in cases
+        ):
+            return "dt_factor" if name == "time_step_factor" else name
+    if parameter in {"dt", "l0"} and all(
+        case.path.name.startswith(("factor_", "alpha_")) for case in cases
+    ):
+        return "dt_factor" if parameter == "dt" else "l0_scale"
+    raise ValueError(
+        f"Cannot find a common recorded '{parameter}' parameter in all cases"
+    )
+
+
+def _parameter_value(case, axis: str) -> float:
+    """Extract the varying setting, using a case-folder fallback if needed."""
+    name = "time_step_factor" if axis == "dt_factor" else axis
+    value = _number_or_nan(case.parameters.get(name))
+    if not np.isfinite(value):
+        for prefix in ("factor_", "alpha_"):
+            if case.path.name.startswith(prefix):
+                value = _number_or_nan(case.path.name[len(prefix) :])
+                break
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"Invalid or missing {axis} for {case.path}")
+    return value
+
+
+def _convergence_record(case, axis: str) -> dict:
+    """Extract one row of original-unit convergence diagnostics."""
+    history = case.history
+    summary = case.summary
+    last = history.iloc[-1]
+
+    recoverable = last.get("recoverable_energy")
+    if recoverable is None:
+        recoverable = _number_or_nan(
+            last.get("elastic_energy")
+        ) + _number_or_nan(last.get("reversible_cohesive_energy", 0.0))
+
+    raw_count = summary.get("raw_num_fragments")
+    if raw_count is None and case.diagnostics is not None:
+        if "raw_num_fragments" in case.diagnostics.columns:
+            raw_count = case.diagnostics["raw_num_fragments"].iloc[-1]
+    if raw_count is None:
+        raw_count = summary.get("num_fragments", last.get("num_fragments"))
+
+    balance_error = _number_or_nan(summary.get("max_relative_energy_error"))
+    if not np.isfinite(balance_error):
+        from .calculations.energy import energy_balance_history
+
+        try:
+            balance = energy_balance_history(history)
+            balance_error = float(balance["relative_energy_error"].max())
+        except (ValueError, KeyError):
+            pass
+
+    wall = summary.get("simulation_wall_time", last.get("simulation_wall_time"))
+
+    try:
+        size, _, _, _ = _fragment_length(case)
+    except (KeyError, ValueError):
+        size = float("nan")
+
+    return {
+        "case": case.path.name,
+        "source_directory": str(case.path),
+        axis: _parameter_value(case, axis),
+        "peak_average_stress_Pa": _number_or_nan(
+            history["average_stress"].max()
+        )
+        if "average_stress" in history
+        else float("nan"),
+        "final_fracture_energy_J": _number_or_nan(last.get("fracture_energy")),
+        "final_recoverable_energy_J": _number_or_nan(recoverable),
+        "final_kinetic_energy_J": _number_or_nan(last.get("kinetic_energy")),
+        "raw_num_fragments": _number_or_nan(raw_count),
+        "mean_fragment_size_m": _number_or_nan(size),
+        "max_relative_energy_error": balance_error,
+        "simulation_wall_time_s": _number_or_nan(wall),
+        "final_time_s": _number_or_nan(
+            summary.get("physical_time", last.get("time"))
+        ),
+    }
+
+
+def run_convergence(args) -> pd.DataFrame:
+    """Load completed cases, calculate differences and plot one quantity."""
+    from .calculations.convergence import build_convergence_table
+    from .plots.convergence import plot_convergence_quantity
+
+    method = args.method.upper()
+    study_dir = Path(args.input).expanduser().resolve()
+    folders = sorted(path for path in study_dir.iterdir() if path.is_dir())
+    cases = []
+    for folder in folders:
+        if not (folder / "summary.out").is_file():
+            warnings.warn(f"Skipping unfinished case: {folder}", stacklevel=2)
+            continue
+        try:
+            cases.append(load_case(method, folder))
+        except (ValueError, KeyError, FileNotFoundError) as exc:
+            warnings.warn(
+                f"Skipping unreadable case {folder.name}: {exc}", stacklevel=2
+            )
+
+    if len(cases) < 2:
+        raise ValueError(
+            f"At least two completed cases are required in {study_dir}"
+        )
+
+    axis = _convergence_parameter(cases, args.parameter)
+    raw = pd.DataFrame(_convergence_record(case, axis) for case in cases)
+    if raw[axis].duplicated().any():
+        raise ValueError(f"Duplicate values of {axis} in {study_dir}")
+
+    # The last case in the resulting table is the reference. For dt/dx,
+    # decreasing values mean refinement; for N, increasing values do.
+    # Horizon and l0 studies are sensitivities, not necessarily convergence.
+    ascending = axis == "number_elements" or args.parameter in {"horizon", "l0"}
+    raw = raw.sort_values(axis, ascending=ascending).reset_index(drop=True)
+
+    quantity = _CONVERGENCE_QUANTITIES[args.quantity]
+    if not np.isfinite(raw[quantity].to_numpy(dtype=float)).all():
+        raise ValueError(
+            f"The selected quantity '{args.quantity}' is unavailable in some cases"
+        )
+
+    # Calculate all metrics available in every simulation; don't fail the
+    # study because an optional metric is missing from an output format.
+    numeric = [
+        q
+        for q in _CONVERGENCE_QUANTITIES.values()
+        if q not in {"raw_num_fragments"}
+        and np.isfinite(raw[q].to_numpy(dtype=float)).all()
+    ]
+    if quantity == "raw_num_fragments":
+        # Counts are tracked as absolute differences, not relative errors.
+        if args.mode != "value":
+            raise ValueError(
+                "For fragment counts, use --mode value; see absolute_change_raw_num_fragments in the CSV"
+            )
+    elif quantity not in numeric:
+        numeric.append(quantity)
+
+    table = build_convergence_table(
+        raw,
+        parameter=axis,
+        quantities=numeric,
+        sort_ascending=None,  # Already ordered coarse-to-fine.
+    )
+
+    fig, ax = plot_convergence_quantity(
+        table,
+        parameter=axis,
+        quantity=quantity,
+        method=method,
+        mode=args.mode,
+    )
+    if args.tolerance is not None:
+        ax.axhline(args.tolerance * 100, linestyle="--", label="Tolerance")
+        ax.legend()
+    fig.tight_layout()
+
+    print(f"\n{method} {args.parameter} convergence: {study_dir}")
+    print(table.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    print(
+        f"\nReference: {table['case'].iloc[-1]} ({axis}={table[axis].iloc[-1]:g})"
+    )
+
+    if args.save or args.output is not None:
+        if args.output is not None:
+            figure_path = Path(args.output).expanduser()
+        else:
+            method_root = DATA_DIR / method
+            try:
+                relative = study_dir.relative_to(method_root.resolve())
+            except ValueError:
+                relative = Path(study_dir.name)
+            figure_path = (
+                FIGURES_DIR
+                / method
+                / relative
+                / f"convergence_{args.parameter}_{args.quantity}_{args.mode}.png"
+            )
+        if figure_path.suffix.lower() not in {".png", ".pdf", ".svg"}:
+            raise ValueError("--output must end with .png, .pdf or .svg")
+        figure_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(figure_path, dpi=DEFAULT_FIGURE_DPI, bbox_inches="tight")
+        summary_path = figure_path.with_name(figure_path.stem + "_summary.csv")
+        table.to_csv(summary_path, index=False)
+        print(f"Figure: {figure_path}\nSummary: {summary_path}")
+
+    if args.no_show:
+        plt.close(fig)
+    else:
+        plt.show()
+    return table
+
+
+# ============================================================================
+# Energy analysis
+# ============================================================================
+
+
+def _energy_output_path(
+    method: str,
+    case_dir: Path,
+    explicit: Path | None,
+    *,
+    view: str,
+    quantity: str,
+    stacked: bool,
+) -> Path:
+    """Choose a descriptive output path for a single energy figure."""
+    if explicit is not None:
+        path = Path(explicit).expanduser()
+    else:
+        try:
+            relative = case_dir.relative_to((DATA_DIR / method).resolve())
+        except ValueError:
+            relative = Path(case_dir.name)
+        label = (
+            f"energy_{quantity}"
+            if view == "history"
+            else f"energy_balance_{quantity}"
+            if view == "balance"
+            else "energy_partition" + ("_stacked" if stacked else "")
+        )
+        path = FIGURES_DIR / method / relative / f"{label}.png"
+    if path.suffix.lower() not in {".png", ".pdf", ".svg"}:
+        raise ValueError("--output must end in .png, .pdf or .svg")
+    return path
+
+
+def run_energy(args) -> pd.DataFrame:
+    """Load one case, analyse its recorded energies and create one figure.
+
+    This also works on *partial* runs where the energy-history file is
+    readable, even if there is no final ``summary.out``. A partial run must
+    not be interpreted as physically completed.
+    """
+    from .calculations.energy import (
+        energy_balance_history,
+        energy_components,
+        energy_partition,
+        summarise_energy,
+    )
+    from .plots.energy import (
+        plot_energy_balance,
+        plot_energy_history,
+        plot_energy_partition,
+    )
+
+    method = args.method.upper()
+    case_dir = Path(args.input).expanduser().resolve()
+    case = load_case(method, case_dir)
+
+    view = getattr(args, "view", "history")
+    quantity = getattr(args, "quantity", "all")
+    balance_kind = getattr(args, "balance_kind", "relative")
+    stacked = getattr(args, "stacked", False)
+    time_unit = getattr(args, "time_unit", "us")
+    energy_unit = getattr(args, "energy_unit", "mJ")
+    initial_energy = getattr(args, "initial_energy", None)
+
+    # Keep method-specific energy definitions in calculations/energy.py.
+    components = energy_components(case.history)
+    if view == "history":
+        analysed = components
+        fig, _ = plot_energy_history(
+            analysed,
+            method=method,
+            quantity=quantity,
+            time_unit=time_unit,
+            energy_unit=energy_unit,
+        )
+        file_quantity = quantity
+    elif view == "balance":
+        analysed = energy_balance_history(
+            components, initial_energy=initial_energy
+        )
+        fig, _ = plot_energy_balance(
+            analysed,
+            quantity=balance_kind,
+            time_unit=time_unit,
+            energy_unit=energy_unit,
+        )
+        file_quantity = balance_kind
+    elif view == "partition":
+        analysed = energy_partition(components)
+        fig, _ = plot_energy_partition(
+            analysed,
+            time_unit=time_unit,
+            stacked=stacked,
+        )
+        file_quantity = "all"
+    else:
+        raise ValueError(f"Unknown energy view: {view!r}")
+
+    fig.tight_layout()
+
+    # The last *recorded* row may precede the simulation's final state.
+    is_completed = (case_dir / "summary.out").is_file()
+    final_row = components.iloc[-1]
+    report = {
+        "method": method,
+        "source_directory": str(case_dir),
+        "run_status": "completed" if is_completed else "partial_or_unverified",
+        "last_recorded_time_s": float(final_row["time"]),
+        "n_samples": len(components),
+        "last_kinetic_energy_J": float(final_row["kinetic_energy"]),
+        "last_recoverable_energy_J": float(final_row["recoverable_energy"]),
+        "last_fracture_energy_J": float(final_row["fracture_energy"]),
+    }
+    if "contact_energy" in components:
+        report["last_contact_energy_J"] = float(final_row["contact_energy"])
+    if "total_energy" in components:
+        report["last_total_energy_J"] = float(final_row["total_energy"])
+    if "external_work" in components:
+        report["last_external_work_J"] = float(final_row["external_work"])
+
+    # Balance diagnostics require a recorded total and external work, and
+    # either an inferred or user-supplied initial energy. A missing balance
+    # must not prevent plotting the individual energy components.
+    if {"total_energy", "external_work"}.issubset(components.columns):
+        try:
+            energy_summary = summarise_energy(
+                components, initial_energy=initial_energy
+            )
+        except (ValueError, KeyError) as exc:
+            warnings.warn(
+                f"Energy-balance summary unavailable: {exc}", stacklevel=2
+            )
+        else:
+            report["initial_total_energy_J"] = (
+                energy_summary.initial_total_energy_J
+            )
+            report["last_energy_error_J"] = energy_summary.last_energy_error_J
+            report["max_relative_energy_error"] = (
+                energy_summary.max_relative_energy_error
+            )
+
+    print(f"\n{method} energy analysis: {case_dir}")
+    if not is_completed:
+        print("WARNING: No summary.out; this may be an interrupted simulation.")
+    print(f"Last recorded time: {report['last_recorded_time_s']:.6g} s")
+    print(f"Kinetic energy:     {report['last_kinetic_energy_J']:.6g} J")
+    print(f"Recoverable energy: {report['last_recoverable_energy_J']:.6g} J")
+    print(f"Fracture energy:    {report['last_fracture_energy_J']:.6g} J")
+    if "max_relative_energy_error" in report:
+        print(
+            "Maximum relative energy error: "
+            f"{100 * report['max_relative_energy_error']:.6g}%"
+        )
+
+    if args.save or args.output is not None:
+        path = _energy_output_path(
+            method,
+            case_dir,
+            args.output,
+            view=view,
+            quantity=file_quantity,
+            stacked=stacked,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=DEFAULT_FIGURE_DPI, bbox_inches="tight")
+        csv_path = path.with_name(path.stem + "_data.csv")
+        json_path = path.with_name(path.stem + "_summary.json")
+        analysed.to_csv(csv_path, index=False)
+        json_path.write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"Figure: {path}\nData: {csv_path}\nSummary: {json_path}")
+
+    if args.no_show:
+        plt.close(fig)
+    else:
+        plt.show()
+    return analysed
+
+
+# ============================================================================
+# Fragment distribution analysis
+# ============================================================================
+
+
+def _distribution_output_path(
+    method: str,
+    case_dir: Path,
+    explicit: Path | None,
+    *,
+    quantity: str,
+    kind: str,
+    normalised: bool,
+    raw: bool,
+    density: bool,
+) -> Path:
+    """Select a distinct filename for each distribution configuration."""
+    if explicit is not None:
+        path = Path(explicit).expanduser()
+    else:
+        try:
+            relative = case_dir.relative_to((DATA_DIR / method).resolve())
+        except ValueError:
+            relative = Path(case_dir.name)
+
+        name = f"distribution_{quantity}_{kind}"
+        if normalised:
+            name += "_normalised"
+        if raw:
+            name += "_raw"
+        if kind == "hist" and not density:
+            name += "_counts"
+        path = FIGURES_DIR / method / relative / f"{name}.png"
+
+    if path.suffix.lower() not in {".png", ".pdf", ".svg"}:
+        raise ValueError("--output must end in .png, .pdf or .svg")
+    return path
+
+
+def run_distribution(args) -> pd.DataFrame:
+    """Analyse one saved fragment snapshot and plot its distribution.
+
+    Unlike the strain-rate workflow, this needs *individual fragment records*.
+    The overall mean in the history cannot determine a size distribution.
+    Incomplete cases are allowed but explicitly identified in the summary.
+
+    The exported CSV contains plot data in display units; the separate
+    samples CSV retains the original per-fragment measurements in SI units.
+    """
+    from .calculations.statistics import (
+        distribution_statistics,
+        empirical_ccdf,
+        empirical_cdf,
+        fragment_values,
+        histogram_distribution,
+    )
+    from .plots.distributions import plot_fragment_distribution
+
+    method = args.method.upper()
+    case_dir = Path(args.input).expanduser().resolve()
+    quantity = args.quantity
+    kind = getattr(args, "kind", "hist")
+    raw = bool(getattr(args, "raw", False))
+    normalised = bool(getattr(args, "normalised", False))
+    density = not bool(getattr(args, "counts", False))
+    unit = getattr(args, "unit", None)
+    log_x = bool(getattr(args, "log_x", False))
+    bins = getattr(args, "bins", 30)
+
+    if kind not in {"hist", "cdf", "ccdf"}:
+        raise ValueError("Distribution kind must be 'hist', 'cdf' or 'ccdf'")
+    if quantity not in {"length", "mass"}:
+        raise ValueError("Distribution quantity must be 'length' or 'mass'")
+    if not isinstance(bins, int) or bins < 1:
+        raise ValueError("--bins must be a positive integer")
+    if raw and method != "PD":
+        raise ValueError("--raw is available only for PD")
+    if raw and quantity == "mass":
+        raise ValueError(
+            "PD raw fragments have no mass; use filtered fragments"
+        )
+    if normalised and unit is not None:
+        raise ValueError("--unit cannot be specified with --normalised")
+    if getattr(args, "counts", False) and kind != "hist":
+        raise ValueError("--counts applies only to --kind hist")
+
+    units = {
+        "length": {"m": 1.0, "mm": 1e3, "um": 1e6},
+        "mass": {"kg": 1.0, "g": 1e3, "mg": 1e6},
+    }
+    if unit is None:
+        unit = "mm" if quantity == "length" else "mg"
+    if unit not in units[quantity]:
+        raise ValueError(
+            f"Invalid unit {unit!r} for {quantity}; "
+            f"expected one of {tuple(units[quantity])}"
+        )
+
+    case = load_case(method, case_dir)
+    # The reader isolates the last snapshot for PD (step) and CZM/PF (time).
+    fragments = case.final_fragments(raw=raw)
+    values_si = fragment_values(fragments, quantity=quantity)
+    stats = distribution_statistics(values_si, quantity=quantity)
+    values = fragment_values(
+        fragments, quantity=quantity, normalised=normalised
+    )
+    displayed = values * (1.0 if normalised else units[quantity][unit])
+
+    fig, _ = plot_fragment_distribution(
+        fragments,
+        quantity=quantity,
+        kind=kind,
+        bins=bins,
+        normalised=normalised,
+        density=density,
+        unit=unit,
+        log_x=log_x,
+        label=method + (" (raw)" if raw else ""),
+    )
+
+    if kind == "hist":
+        heights, edges = histogram_distribution(
+            displayed, quantity=quantity, bins=bins, density=density
+        )
+        analysed = pd.DataFrame(
+            {"bin_left": edges[:-1], "bin_right": edges[1:], "height": heights}
+        )
+    else:
+        x, y = (
+            empirical_cdf(displayed, quantity=quantity)
+            if kind == "cdf"
+            else empirical_ccdf(displayed, quantity=quantity)
+        )
+        analysed = pd.DataFrame({"value": x, "probability": y})
+
+    snapshot_time = (
+        float(fragments["time"].iloc[-1])
+        if "time" in fragments.columns
+        else None
+    )
+    snapshot_step = (
+        int(fragments["step"].iloc[-1]) if "step" in fragments.columns else None
+    )
+    completed = (case_dir / "summary.out").is_file()
+
+    # JSON standard does not permit NaN or Infinity.
+    reported_stats = asdict(stats)
+    for key, value in reported_stats.items():
+        if isinstance(value, float) and not np.isfinite(value):
+            reported_stats[key] = None
+
+    report = {
+        "method": method,
+        "source_directory": str(case_dir),
+        "run_status": "completed" if completed else "partial_or_unverified",
+        "snapshot_time_s": snapshot_time,
+        "snapshot_step": snapshot_step,
+        "fragment_set": "raw" if raw else "filtered_or_standard",
+        "quantity": quantity,
+        "kind": kind,
+        "normalised": normalised,
+        "display_unit": "dimensionless" if normalised else unit,
+        "histogram_density": density if kind == "hist" else None,
+        "statistics_SI": reported_stats,
+    }
+
+    print(f"\n{method} fragment distribution: {case_dir}")
+    if not completed:
+        print("WARNING: No summary.out; fragment snapshot may be incomplete.")
+    print(f"Fragment set: {'raw' if raw else 'filtered/standard'}")
+    print(f"Count: {stats.count}")
+    print(f"Mean: {stats.mean:.6g} {'m' if quantity == 'length' else 'kg'}")
+    print(f"Median: {stats.median:.6g} {'m' if quantity == 'length' else 'kg'}")
+    print(f"Coefficient of variation: {stats.coefficient_of_variation:.6g}")
+
+    if args.save or args.output is not None:
+        path = _distribution_output_path(
+            method,
+            case_dir,
+            args.output,
+            quantity=quantity,
+            kind=kind,
+            normalised=normalised,
+            raw=raw,
+            density=density,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=DEFAULT_FIGURE_DPI, bbox_inches="tight")
+        csv_path = path.with_name(path.stem + "_data.csv")
+        samples_path = path.with_name(path.stem + "_samples.csv")
+        json_path = path.with_name(path.stem + "_summary.json")
+        analysed.to_csv(csv_path, index=False)
+        pd.DataFrame(
+            {"value_SI": values_si, "display_value": displayed}
+        ).to_csv(samples_path, index=False)
+        json_path.write_text(
+            json.dumps(report, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"Figure: {path}\n"
+            f"Distribution data: {csv_path}\n"
+            f"Fragment samples: {samples_path}\n"
+            f"Summary: {json_path}"
+        )
+
+    if args.no_show:
+        plt.close(fig)
+    else:
+        plt.show()
+    return analysed
+
+
+# ============================================================================
+# General scalar histories
+# ============================================================================
+
+
+def _history_spatial_output_path(
+    method: str,
+    case_dir: Path,
+    explicit: Path | None,
+    filename: str,
+) -> Path:
+    """Locate a figure beside the corresponding method/experiment results."""
+    if explicit is not None:
+        path = Path(explicit).expanduser()
+    else:
+        try:
+            relative = case_dir.relative_to((DATA_DIR / method).resolve())
+        except ValueError:
+            relative = Path(case_dir.name)
+        path = FIGURES_DIR / method / relative / f"{filename}.png"
+    if path.suffix.lower() not in {".png", ".pdf", ".svg"}:
+        raise ValueError("--output must end in .png, .pdf or .svg")
+    return path
+
+
+def _write_history_spatial_results(
+    *,
+    fig,
+    analysed: pd.DataFrame,
+    report: dict,
+    path: Path,
+) -> None:
+    """Save the figure, source data and analysis metadata together."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=DEFAULT_FIGURE_DPI, bbox_inches="tight")
+    data_path = path.with_name(path.stem + "_data.csv")
+    report_path = path.with_name(path.stem + "_summary.json")
+    analysed.to_csv(data_path, index=False)
+    report_path.write_text(
+        json.dumps(report, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Figure: {path}\nData: {data_path}\nSummary: {report_path}")
+
+
+def run_history(args) -> pd.DataFrame:
+    """Plot a diagnostic time series, optionally overlaying other cases."""
+    from .plots.history import plot_history
+
+    method = args.method.upper()
+    case_dir = Path(args.input).expanduser().resolve()
+    directories = [case_dir, *getattr(args, "stack_input", [])]
+    quantity = args.quantity
+    source = getattr(args, "source", "history")
+    time_unit = getattr(args, "time_unit", "us")
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    curves = []
+    for directory in directories:
+        case = load_case(method, directory)
+        if source == "diagnostics":
+            table = getattr(case, "diagnostics", None)
+        else:
+            table = case.history
+        if table is None or table.empty:
+            raise ValueError(f"No {source} data in {directory}")
+        if "time" not in table or quantity not in table:
+            raise ValueError(
+                f"Missing 'time' or '{quantity}' in {directory}. "
+                f"Available: {', '.join(table.columns)}"
+            )
+        curve = table[["time", quantity]].copy()
+        curve["case"] = str(directory)
+        curves.append(curve)
+        plot_history(
+            table,
+            quantity=quantity,
+            time_unit=time_unit,
+            label=f"{method} | {directory.name}",
+            ax=ax,
+        )
+
+    analysed = pd.concat(curves, ignore_index=True)
+    ax.set_title(f"{method} | {quantity.replace('_', ' ')}")
+    fig.tight_layout()
+    print(f"{method} {quantity}: {len(directories)} case(s)")
+
+    if args.save or args.output is not None:
+        filename = f"history_{quantity}" + (
+            "_overlay" if len(directories) > 1 else ""
+        )
+        path = _history_spatial_output_path(
+            method, case_dir, args.output, filename
+        )
+        _write_history_spatial_results(
+            fig=fig,
+            analysed=analysed,
+            report={
+                "analysis": "history",
+                "method": method,
+                "quantity": quantity,
+                "source": source,
+                "time_unit": time_unit,
+                "cases": [str(d) for d in directories],
+            },
+            path=path,
+        )
+
+    if args.no_show:
+        plt.close(fig)
+    else:
+        plt.show()
+    return analysed
+
+
+# ============================================================================
+# Spatial fracture positions (separate from time histories)
+# ============================================================================
+
+
+def run_spatial(args) -> pd.DataFrame:
+    """Draw reference-position fracture marks for one or several 1D bars.
+
+    Every row is a saved fragment snapshot, not an instantaneous crack event.
+    """
+    from .calculations.fracture_locations import fracture_snapshots
+    from .plots.spatial import plot_fracture_positions
+
+    method = args.method.upper()
+    case_dir = Path(args.input).expanduser().resolve()
+    directories = [case_dir, *getattr(args, "stack_input", [])]
+    all_snapshots = bool(getattr(args, "all_snapshots", False))
+    max_snapshots = int(getattr(args, "max_snapshots", 12))
+    raw = bool(getattr(args, "raw", False))
+    position_unit = getattr(args, "position_unit", "mm")
+
+    snapshots = []
+    for directory in directories:
+        case = load_case(method, directory)
+        snapshots.extend(
+            fracture_snapshots(
+                case,
+                raw=raw,
+                all_snapshots=all_snapshots,
+                max_snapshots=max_snapshots,
+            )
+        )
+
+    fig, _ = plot_fracture_positions(snapshots, position_unit=position_unit)
+    rows = []
+    for index, snap in enumerate(snapshots):
+        for position in snap.positions_m or (float("nan"),):
+            rows.append(
+                {
+                    "snapshot": index,
+                    "label": snap.label,
+                    "source": snap.source,
+                    "time_s": snap.time_s,
+                    "step": snap.step,
+                    "fracture_position_m": position,
+                    "num_fractures": snap.count,
+                }
+            )
+    analysed = pd.DataFrame(rows)
+    print(f"{method} spatial fractures: {len(snapshots)} snapshot(s)")
+    for snap in snapshots:
+        print(f"  {snap.label}: {snap.count} fractures")
+
+    if args.save or args.output is not None:
+        filename = "fracture_positions"
+        if all_snapshots:
+            filename += "_snapshots"
+        if raw:
+            filename += "_raw"
+        if len(directories) > 1:
+            filename += "_stacked"
+        path = _history_spatial_output_path(
+            method, case_dir, args.output, filename
+        )
+        _write_history_spatial_results(
+            fig=fig,
+            analysed=analysed,
+            report={
+                "analysis": "spatial",
+                "method": method,
+                "position_unit": position_unit,
+                "raw_fragments": raw,
+                "all_snapshots": all_snapshots,
+                "cases": [str(d) for d in directories],
+                "snapshots": [
+                    {
+                        "source": snap.source,
+                        "label": snap.label,
+                        "time_s": snap.time_s,
+                        "step": snap.step,
+                        "left_m": snap.left_m,
+                        "right_m": snap.right_m,
+                        "num_fractures": snap.count,
+                        "fracture_positions_m": list(snap.positions_m),
+                    }
+                    for snap in snapshots
+                ],
+            },
+            path=path,
+        )
+
+    if args.no_show:
+        plt.close(fig)
+    else:
+        plt.show()
+    return analysed
+
+
+def run_analysis(args) -> None:
+    """Dispatch one CLI command to its implemented workflow."""
+    if args.analysis == "strain-rate":
+        run_strain_rate(args)
+        return
+
+    if args.analysis == "convergence":
+        run_convergence(args)
+        return
+
+    if args.analysis == "energy":
+        run_energy(args)
+        return
+
+    if args.analysis == "distribution":
+        run_distribution(args)
+        return
+
+    if args.analysis == "history":
+        run_history(args)
+        return
+
+    if args.analysis == "spatial":
+        run_spatial(args)
+        return
+
+    raise NotImplementedError(
+        f"The '{args.analysis}' workflow is not yet implemented. "
+        "Currently available: strain-rate, convergence, energy, "
+        "distribution, history, spatial."
+    )

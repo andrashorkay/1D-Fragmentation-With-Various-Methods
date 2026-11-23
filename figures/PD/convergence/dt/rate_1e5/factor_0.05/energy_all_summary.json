@@ -1,0 +1,16 @@
+{
+  "method": "PD",
+  "source_directory": "/home/andras/Documents/MA3/project/data/PD/convergence/dt/rate_1e5/factor_0.05",
+  "run_status": "completed",
+  "last_recorded_time_s": 9.999578367440027e-07,
+  "n_samples": 191,
+  "last_kinetic_energy_J": 0.205463520472754,
+  "last_recoverable_energy_J": 0.0077519606194431,
+  "last_fracture_energy_J": 0.0064086894267824,
+  "last_contact_energy_J": 0.0,
+  "last_total_energy_J": 0.3193478854537719,
+  "last_external_work_J": 0.1162058844822455,
+  "initial_total_energy_J": 0.20312499682617197,
+  "last_energy_error_J": -1.700414535443784e-05,
+  "max_relative_energy_error": 6.34502503472629e-05
+}

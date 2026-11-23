@@ -1,0 +1,29 @@
+{
+  "method": "PD",
+  "source_directory": "/home/andras/Documents/MA3/project/data/PD/convergence/dt/rate_1e5/factor_0.05",
+  "run_status": "completed",
+  "snapshot_time_s": 9.999578367440027e-07,
+  "snapshot_step": 18955,
+  "fragment_set": "filtered_or_standard",
+  "quantity": "length",
+  "kind": "cdf",
+  "normalised": true,
+  "display_unit": "dimensionless",
+  "histogram_density": null,
+  "statistics_SI": {
+    "quantity": "length",
+    "count": 50,
+    "mean": 9.9999999999986e-05,
+    "median": 0.000100625,
+    "standard_deviation": 3.07161907631591e-05,
+    "coefficient_of_variation": 0.30716190763163403,
+    "minimum": 6.375e-05,
+    "maximum": 0.0002012499999999,
+    "q05": 6.653125000000001e-05,
+    "q25": 6.750000000000007e-05,
+    "q75": 0.00011609375000000001,
+    "q95": 0.00014784374999989998,
+    "interquartile_range": 4.8593749999999944e-05,
+    "total": 0.0049999999999993
+  }
+}

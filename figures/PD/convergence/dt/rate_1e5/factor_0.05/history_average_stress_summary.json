@@ -1,0 +1,10 @@
+{
+  "analysis": "history",
+  "method": "PD",
+  "quantity": "average_stress",
+  "source": "history",
+  "time_unit": "us",
+  "cases": [
+    "/home/andras/Documents/MA3/project/data/PD/convergence/dt/rate_1e5/factor_0.05"
+  ]
+}

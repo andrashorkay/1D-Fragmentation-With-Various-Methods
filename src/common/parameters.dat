@@ -1,0 +1,36 @@
+seed = 1
+
+material common_material [
+
+  rho = 3900.0
+  E = 370000000000
+  nu = 0.
+
+  sigma_c = 262000000
+  G_c = 50.
+
+]
+
+random_field [
+
+  spatial_model = correlated
+  distribution = gaussian
+
+  scatter = 0.05
+
+  points_per_correlation_length = 8
+
+  number_material_points = 10001
+
+  weibull_scale = 262000000
+  weibull_shape = 10.
+
+]
+
+user parameters [
+
+  bar_length = 0.005
+
+  output_file = material_field.dat
+
+]
